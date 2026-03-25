@@ -79,7 +79,6 @@ struct AppState {
 
     GtkWidget *window;
     GtkWidget *btn_connect;
-    GtkWidget *indicator;
     GtkWidget *lbl_time;
     GtkWidget *lbl_up;
     GtkWidget *lbl_down;
@@ -98,6 +97,9 @@ struct AppState {
     GtkWidget *dlg_routing;
     GtkWidget *exclude_listbox;
     GtkWidget *exclude_entry;
+
+    std::map<int, std::string> ping_results;
+    std::mutex ping_mutex;
 };
 
 static AppState app;
@@ -153,8 +155,11 @@ static void load_excludes() {
     while (std::getline(f, line)) {
         std::istringstream ss(line);
         std::string type, val;
-        if (std::getline(ss, type, '\t') && std::getline(ss, val, '\t')) {
-            app.excludes.push_back({val, type == "domain"});
+        if (std::getline(ss, type, '\t') && std::getline(ss, val)) {
+            while (!val.empty() && (val.back() == '\n' || val.back() == '\r' || val.back() == '\t'))
+                val.pop_back();
+            if (!val.empty())
+                app.excludes.push_back({val, type == "domain"});
         }
     }
 }
@@ -189,20 +194,56 @@ static std::string fmt_duration(int secs) {
 
 static std::vector<std::string> resolve_domain(const std::string &domain) {
     std::vector<std::string> ips;
+    std::set<std::string> seen;
     struct addrinfo hints{}, *res, *p;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
+
+    auto do_resolve = [&](const std::string &name) {
+        res = nullptr;
+        if (getaddrinfo(name.c_str(), nullptr, &hints, &res) == 0 && res) {
+            for (p = res; p; p = p->ai_next) {
+                char buf[INET_ADDRSTRLEN];
+                struct sockaddr_in *addr = (struct sockaddr_in *)p->ai_addr;
+                inet_ntop(AF_INET, &addr->sin_addr, buf, sizeof(buf));
+                std::string ip(buf);
+                if (seen.find(ip) == seen.end()) {
+                    seen.insert(ip);
+                    ips.push_back(ip);
+                }
+            }
+            freeaddrinfo(res);
+        }
+    };
+
     std::string d = domain;
     if (!d.empty() && d[0] == '.') d = d.substr(1);
-    if (getaddrinfo(d.c_str(), nullptr, &hints, &res) != 0) return ips;
-    for (p = res; p; p = p->ai_next) {
-        char buf[INET_ADDRSTRLEN];
-        struct sockaddr_in *addr = (struct sockaddr_in *)p->ai_addr;
-        inet_ntop(AF_INET, &addr->sin_addr, buf, sizeof(buf));
-        ips.push_back(buf);
+    if (d.empty()) return ips;
+
+    do_resolve(d);
+
+    const char *prefixes[] = {"www.", "mail.", "api.", "cdn.", "m.", "static.",
+                              "img.", "video.", "music.", "auth.", "login.",
+                              "accounts.", "play.", "maps."};
+    for (auto pfx : prefixes) {
+        do_resolve(std::string(pfx) + d);
     }
-    freeaddrinfo(res);
+
     return ips;
+}
+
+static std::string resolve_host_to_ip(const std::string &host) {
+    struct addrinfo hints{}, *res;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) == 0 && res) {
+        char buf[INET_ADDRSTRLEN];
+        struct sockaddr_in *addr = (struct sockaddr_in *)res->ai_addr;
+        inet_ntop(AF_INET, &addr->sin_addr, buf, sizeof(buf));
+        freeaddrinfo(res);
+        return std::string(buf);
+    }
+    return host;
 }
 
 static std::string get_default_iface() {
@@ -216,6 +257,59 @@ static std::string get_default_iface() {
     return iface;
 }
 
+static int tcp_ping(const std::string &host, int port, int timeout_ms) {
+    std::string ip = resolve_host_to_ip(host);
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
+
+    auto start = std::chrono::steady_clock::now();
+
+    int ret = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+    if (ret == 0) {
+        close(sock);
+        auto end = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    }
+
+    if (errno != EINPROGRESS) {
+        close(sock);
+        return -1;
+    }
+
+    fd_set wset;
+    FD_ZERO(&wset);
+    FD_SET(sock, &wset);
+
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+    ret = select(sock + 1, nullptr, &wset, nullptr, &tv);
+    auto end = std::chrono::steady_clock::now();
+    int ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    if (ret > 0) {
+        int err = 0;
+        socklen_t len = sizeof(err);
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &len);
+        close(sock);
+        if (err == 0) return ms;
+        return -1;
+    }
+
+    close(sock);
+    return -1;
+}
+
 static void vpn_connect_thread() {
     if (app.selected_config < 0 || app.selected_config >= (int)app.configs.size()) {
         app.connecting = false;
@@ -226,22 +320,44 @@ static void vpn_connect_thread() {
 
     setenv("SSHPASS", cfg.password.c_str(), 1);
 
+    std::string server_ip = resolve_host_to_ip(cfg.host);
+
+    bool has_domain_excludes = false;
+    for (auto &e : app.excludes) {
+        if (e.is_domain) { has_domain_excludes = true; break; }
+    }
+
     std::vector<std::string> args;
     args.push_back("sshuttle");
-    args.push_back("--dns");
+
+    if (!has_domain_excludes) {
+        args.push_back("--dns");
+    }
+
     args.push_back("-r");
     args.push_back(cfg.username + "@" + cfg.host + ":" + std::to_string(cfg.port));
     args.push_back("0.0.0.0/0");
 
     args.push_back("-x");
-    args.push_back(cfg.host + "/32");
+    args.push_back(server_ip + "/32");
+
+    if (server_ip != cfg.host) {
+        args.push_back("-x");
+        args.push_back(cfg.host + "/32");
+    }
+
+    std::set<std::string> excluded_ips;
+    excluded_ips.insert(server_ip);
 
     for (auto &e : app.excludes) {
         if (e.is_domain) {
             auto ips = resolve_domain(e.value);
             for (auto &ip : ips) {
-                args.push_back("-x");
-                args.push_back(ip + "/32");
+                if (excluded_ips.find(ip) == excluded_ips.end()) {
+                    excluded_ips.insert(ip);
+                    args.push_back("-x");
+                    args.push_back(ip + "/32");
+                }
             }
         } else {
             if (!e.value.empty()) {
@@ -272,7 +388,7 @@ static void vpn_connect_thread() {
         return;
     }
 
-    sleep(4);
+    sleep(5);
 
     int status;
     pid_t result = waitpid(app.proxy_pid, &status, WNOHANG);
@@ -293,12 +409,21 @@ static void vpn_connect_thread() {
 static void vpn_disconnect() {
     if (app.proxy_pid > 0) {
         kill(app.proxy_pid, SIGTERM);
-        usleep(500000);
-        kill(app.proxy_pid, SIGKILL);
-        waitpid(app.proxy_pid, nullptr, WNOHANG);
+        int wait_count = 0;
+        while (wait_count < 20) {
+            int status;
+            pid_t r = waitpid(app.proxy_pid, &status, WNOHANG);
+            if (r > 0) break;
+            usleep(250000);
+            wait_count++;
+        }
+        int status;
+        if (waitpid(app.proxy_pid, &status, WNOHANG) == 0) {
+            kill(app.proxy_pid, SIGKILL);
+            waitpid(app.proxy_pid, nullptr, 0);
+        }
         app.proxy_pid = -1;
     }
-    system("pkill -f sshuttle 2>/dev/null");
     app.connected = false;
     app.connecting = false;
 }
@@ -336,33 +461,14 @@ static void read_net_stats() {
     app.bytes_sent = tx - base_tx;
 }
 
-static gboolean draw_indicator(GtkWidget *widget, cairo_t *cr, gpointer) {
-    int w = gtk_widget_get_allocated_width(widget);
-    int h = gtk_widget_get_allocated_height(widget);
-    double cx = w / 2.0, cy = h / 2.0;
-    double r = std::min(w, h) / 2.0 - 2;
+static void refresh_config_list();
 
-    if (app.connecting) {
-        cairo_set_source_rgb(cr, 1.0, 0.8, 0.0);
-    } else if (app.connected) {
-        cairo_set_source_rgb(cr, 0.1, 0.8, 0.1);
-    } else {
-        cairo_set_source_rgb(cr, 0.9, 0.1, 0.1);
-    }
-
-    cairo_arc(cr, cx, cy, r, 0, 2 * G_PI);
-    cairo_fill(cr);
-
-    cairo_set_source_rgba(cr, 1, 1, 1, 0.3);
-    cairo_arc(cr, cx - r * 0.2, cy - r * 0.2, r * 0.5, 0, 2 * G_PI);
-    cairo_fill(cr);
-
+static gboolean update_ping_ui(gpointer) {
+    refresh_config_list();
     return FALSE;
 }
 
 static gboolean update_ui(gpointer) {
-    gtk_widget_queue_draw(app.indicator);
-
     if (app.connected) {
         auto now = std::chrono::steady_clock::now();
         int secs = std::chrono::duration_cast<std::chrono::seconds>(now - app.connect_time).count();
@@ -409,9 +515,10 @@ static gboolean update_ui(gpointer) {
 }
 
 static void show_edit_dialog(int idx);
-static void refresh_config_list();
 
 static void refresh_config_list() {
+    int sel = app.selected_config;
+
     GList *children = gtk_container_get_children(GTK_CONTAINER(app.config_listbox));
     for (GList *l = children; l; l = l->next)
         gtk_widget_destroy(GTK_WIDGET(l->data));
@@ -419,7 +526,18 @@ static void refresh_config_list() {
 
     for (int i = 0; i < (int)app.configs.size(); i++) {
         auto &c = app.configs[i];
+
+        std::string ping_str;
+        {
+            std::lock_guard<std::mutex> lock(app.ping_mutex);
+            auto it = app.ping_results.find(i);
+            if (it != app.ping_results.end())
+                ping_str = it->second;
+        }
+
         std::string label = c.name + "  (" + c.username + "@" + c.host + ":" + std::to_string(c.port) + ")";
+        if (!ping_str.empty())
+            label += "  " + ping_str;
 
         GtkWidget *row = gtk_list_box_row_new();
         GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
@@ -437,6 +555,10 @@ static void refresh_config_list() {
             int idx = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(w), "idx"));
             if (idx >= 0 && idx < (int)app.configs.size()) {
                 app.configs.erase(app.configs.begin() + idx);
+                {
+                    std::lock_guard<std::mutex> lock(app.ping_mutex);
+                    app.ping_results.erase(idx);
+                }
                 if (app.selected_config == idx) app.selected_config = -1;
                 else if (app.selected_config > idx) app.selected_config--;
                 save_configs();
@@ -461,9 +583,9 @@ static void refresh_config_list() {
 
     gtk_widget_show_all(app.config_listbox);
 
-    if (app.selected_config >= 0 && app.selected_config < (int)app.configs.size()) {
+    if (sel >= 0 && sel < (int)app.configs.size()) {
         GtkListBoxRow *row = gtk_list_box_get_row_at_index(
-            GTK_LIST_BOX(app.config_listbox), app.selected_config);
+            GTK_LIST_BOX(app.config_listbox), sel);
         if (row) gtk_list_box_select_row(GTK_LIST_BOX(app.config_listbox), row);
     }
 }
@@ -543,9 +665,8 @@ static void show_edit_dialog(int idx) {
         delete ed;
     }), ed);
 
-    g_signal_connect(dlg, "destroy", G_CALLBACK(+[](GtkWidget *, gpointer data) {
-        (void)data;
-    }), ed);
+    g_signal_connect(dlg, "destroy", G_CALLBACK(+[](GtkWidget *, gpointer) {
+    }), nullptr);
 
     gtk_widget_show_all(dlg);
 }
@@ -560,13 +681,20 @@ static void refresh_exclude_list() {
 
     for (int i = 0; i < (int)app.excludes.size(); i++) {
         auto &e = app.excludes[i];
-        std::string label = (e.is_domain ? "🌐 " : "📍 ") + e.value;
+
+        std::string display;
+        if (e.is_domain) {
+            auto ips = resolve_domain(e.value);
+            display = "🌐 " + e.value + "  [" + std::to_string(ips.size()) + " IPs]";
+        } else {
+            display = "📍 " + e.value;
+        }
 
         GtkWidget *row = gtk_list_box_row_new();
         GtkWidget *hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
         gtk_container_set_border_width(GTK_CONTAINER(hbox), 2);
 
-        GtkWidget *lbl = gtk_label_new(label.c_str());
+        GtkWidget *lbl = gtk_label_new(display.c_str());
         gtk_label_set_xalign(GTK_LABEL(lbl), 0);
         gtk_widget_set_hexpand(lbl, TRUE);
         gtk_box_pack_start(GTK_BOX(hbox), lbl, TRUE, TRUE, 0);
@@ -696,42 +824,108 @@ static void show_add_dialog() {
     gtk_widget_show_all(app.dlg_add);
 }
 
+static std::string clean_input_domain(const std::string &raw) {
+    std::string s = raw;
+    while (!s.empty() && s[0] == ' ') s.erase(0, 1);
+    while (!s.empty() && s.back() == ' ') s.pop_back();
+
+    auto pos = s.find("://");
+    if (pos != std::string::npos) s = s.substr(pos + 3);
+
+    bool looks_like_ip = true;
+    for (char ch : s) {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '-') {
+            looks_like_ip = false;
+            break;
+        }
+    }
+
+    if (!looks_like_ip) {
+        pos = s.find('/');
+        if (pos != std::string::npos) s = s.substr(0, pos);
+        pos = s.find(':');
+        if (pos != std::string::npos) s = s.substr(0, pos);
+    }
+
+    while (!s.empty() && s.back() == '.') s.pop_back();
+
+    return s;
+}
+
+static bool is_ip_value(const std::string &val) {
+    for (char ch : val) {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void add_exclude_values(const std::string &text) {
+    std::istringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        std::string cleaned = clean_input_domain(item);
+        if (cleaned.empty()) continue;
+
+        bool exists = false;
+        for (auto &e : app.excludes) {
+            if (e.value == cleaned) { exists = true; break; }
+        }
+        if (exists) continue;
+
+        bool ip = is_ip_value(cleaned);
+        app.excludes.push_back({cleaned, !ip});
+    }
+    save_excludes();
+    refresh_exclude_list();
+}
+
+static void ping_all_configs() {
+    std::thread([]() {
+        for (int i = 0; i < (int)app.configs.size(); i++) {
+            {
+                std::lock_guard<std::mutex> lock(app.ping_mutex);
+                app.ping_results[i] = "⏳";
+            }
+            g_idle_add(update_ping_ui, nullptr);
+
+            int ms = tcp_ping(app.configs[i].host, app.configs[i].port, 5000);
+
+            {
+                std::lock_guard<std::mutex> lock(app.ping_mutex);
+                if (ms >= 0) {
+                    std::string color;
+                    if (ms < 100) color = "🟢";
+                    else if (ms < 300) color = "🟡";
+                    else color = "🔴";
+                    app.ping_results[i] = color + " " + std::to_string(ms) + " ms";
+                } else {
+                    app.ping_results[i] = "🔴 timeout";
+                }
+            }
+            g_idle_add(update_ping_ui, nullptr);
+        }
+    }).detach();
+}
+
 static void show_routing_dialog() {
     app.dlg_routing = gtk_dialog_new_with_buttons("Routing Exclusions",
         GTK_WINDOW(app.window),
         (GtkDialogFlags)(GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT),
         nullptr);
-    gtk_window_set_default_size(GTK_WINDOW(app.dlg_routing), 450, 400);
+    gtk_window_set_default_size(GTK_WINDOW(app.dlg_routing), 500, 400);
 
     GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(app.dlg_routing));
     gtk_container_set_border_width(GTK_CONTAINER(content), 12);
 
-    GtkWidget *lbl_info = gtk_label_new("Excluded domains and IPs will bypass VPN:");
+    GtkWidget *lbl_info = gtk_label_new(
+        "Excluded domains/IPs bypass VPN.\n"
+        "Domains are resolved to IPs at connect time.\n"
+        "When domain exclusions are active, DNS goes directly.");
     gtk_label_set_xalign(GTK_LABEL(lbl_info), 0);
+    gtk_label_set_line_wrap(GTK_LABEL(lbl_info), TRUE);
     gtk_box_pack_start(GTK_BOX(content), lbl_info, FALSE, FALSE, 4);
-
-    GtkWidget *quick_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    gtk_box_pack_start(GTK_BOX(content), quick_box, FALSE, FALSE, 4);
-
-    auto add_quick = [&](const char *label, const char *domain) {
-        GtkWidget *btn = gtk_button_new_with_label(label);
-        g_object_set_data_full(G_OBJECT(btn), "domain", g_strdup(domain), g_free);
-        g_signal_connect(btn, "clicked", G_CALLBACK(+[](GtkWidget *w, gpointer) {
-            const char *d = (const char*)g_object_get_data(G_OBJECT(w), "domain");
-            for (auto &e : app.excludes)
-                if (e.value == d) return;
-            app.excludes.push_back({d, true});
-            save_excludes();
-            refresh_exclude_list();
-        }), nullptr);
-        gtk_box_pack_start(GTK_BOX(quick_box), btn, FALSE, FALSE, 0);
-    };
-
-    add_quick(".ru", ".ru");
-    add_quick(".com", ".com");
-    add_quick(".net", ".net");
-    add_quick(".org", ".org");
-    add_quick(".su", ".su");
 
     GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_box_pack_start(GTK_BOX(content), sep, FALSE, FALSE, 4);
@@ -740,7 +934,8 @@ static void show_routing_dialog() {
     gtk_box_pack_start(GTK_BOX(content), add_box, FALSE, FALSE, 4);
 
     app.exclude_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(app.exclude_entry), "example.com, .ru, 1.2.3.4, 10.0.0.0/24");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(app.exclude_entry),
+        "example.com, 1.2.3.4, 10.0.0.0/24 (comma-separated)");
     gtk_widget_set_hexpand(app.exclude_entry, TRUE);
     gtk_box_pack_start(GTK_BOX(add_box), app.exclude_entry, TRUE, TRUE, 0);
 
@@ -749,22 +944,14 @@ static void show_routing_dialog() {
     g_signal_connect(btn_add_exc, "clicked", G_CALLBACK(+[](GtkWidget *, gpointer) {
         const char *val = gtk_entry_get_text(GTK_ENTRY(app.exclude_entry));
         if (!val || strlen(val) == 0) return;
-        std::string v(val);
-        while (!v.empty() && v[0] == ' ') v.erase(0, 1);
-        while (!v.empty() && v.back() == ' ') v.pop_back();
-        if (v.empty()) return;
-        for (auto &e : app.excludes)
-            if (e.value == v) return;
-        bool is_ip = true;
-        for (char ch : v) {
-            if (ch != '.' && ch != '/' && !(ch >= '0' && ch <= '9')) {
-                is_ip = false;
-                break;
-            }
-        }
-        app.excludes.push_back({v, !is_ip});
-        save_excludes();
-        refresh_exclude_list();
+        add_exclude_values(std::string(val));
+        gtk_entry_set_text(GTK_ENTRY(app.exclude_entry), "");
+    }), nullptr);
+
+    g_signal_connect(app.exclude_entry, "activate", G_CALLBACK(+[](GtkWidget *, gpointer) {
+        const char *val = gtk_entry_get_text(GTK_ENTRY(app.exclude_entry));
+        if (!val || strlen(val) == 0) return;
+        add_exclude_values(std::string(val));
         gtk_entry_set_text(GTK_ENTRY(app.exclude_entry), "");
     }), nullptr);
 
@@ -798,7 +985,7 @@ static void activate(GtkApplication *gtkapp, gpointer) {
 
     app.window = gtk_application_window_new(gtkapp);
     gtk_window_set_title(GTK_WINDOW(app.window), "SSH VPN");
-    gtk_window_set_default_size(GTK_WINDOW(app.window), 380, 540);
+    gtk_window_set_default_size(GTK_WINDOW(app.window), 420, 580);
     gtk_window_set_resizable(GTK_WINDOW(app.window), TRUE);
 
     GtkCssProvider *css = gtk_css_provider_new();
@@ -827,12 +1014,6 @@ static void activate(GtkApplication *gtkapp, gpointer) {
     GtkWidget *main_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_set_border_width(GTK_CONTAINER(main_box), 16);
     gtk_container_add(GTK_CONTAINER(app.window), main_box);
-
-    app.indicator = gtk_drawing_area_new();
-    gtk_widget_set_size_request(app.indicator, 80, 80);
-    gtk_widget_set_halign(app.indicator, GTK_ALIGN_CENTER);
-    g_signal_connect(app.indicator, "draw", G_CALLBACK(draw_indicator), nullptr);
-    gtk_box_pack_start(GTK_BOX(main_box), app.indicator, FALSE, FALSE, 8);
 
     app.lbl_time = gtk_label_new("00:00:00");
     GtkStyleContext *ctx = gtk_widget_get_style_context(app.lbl_time);
@@ -877,12 +1058,22 @@ static void activate(GtkApplication *gtkapp, gpointer) {
     GtkWidget *sep1 = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_box_pack_start(GTK_BOX(main_box), sep1, FALSE, FALSE, 8);
 
+    GtkWidget *mid_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(mid_box, GTK_ALIGN_CENTER);
+    gtk_box_pack_start(GTK_BOX(main_box), mid_box, FALSE, FALSE, 4);
+
     app.btn_routing = gtk_button_new_with_label("⚙  Routing Exclusions");
-    gtk_widget_set_halign(app.btn_routing, GTK_ALIGN_CENTER);
     g_signal_connect(app.btn_routing, "clicked", G_CALLBACK(+[](GtkWidget *, gpointer) {
         show_routing_dialog();
     }), nullptr);
-    gtk_box_pack_start(GTK_BOX(main_box), app.btn_routing, FALSE, FALSE, 4);
+    gtk_box_pack_start(GTK_BOX(mid_box), app.btn_routing, FALSE, FALSE, 0);
+
+    GtkWidget *btn_ping = gtk_button_new_with_label("Ping All");
+    g_signal_connect(btn_ping, "clicked", G_CALLBACK(+[](GtkWidget *, gpointer) {
+        if (app.configs.empty()) return;
+        ping_all_configs();
+    }), nullptr);
+    gtk_box_pack_start(GTK_BOX(mid_box), btn_ping, FALSE, FALSE, 0);
 
     GtkWidget *sep2 = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_box_pack_start(GTK_BOX(main_box), sep2, FALSE, FALSE, 8);
