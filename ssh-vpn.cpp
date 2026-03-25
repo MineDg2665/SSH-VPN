@@ -79,6 +79,7 @@ struct AppState {
 
     GtkWidget *window;
     GtkWidget *btn_connect;
+    GtkWidget *indicator;
     GtkWidget *lbl_time;
     GtkWidget *lbl_up;
     GtkWidget *lbl_down;
@@ -461,6 +462,30 @@ static void read_net_stats() {
     app.bytes_sent = tx - base_tx;
 }
 
+static gboolean draw_indicator(GtkWidget *widget, cairo_t *cr, gpointer) {
+    int w = gtk_widget_get_allocated_width(widget);
+    int h = gtk_widget_get_allocated_height(widget);
+    double cx = w / 2.0, cy = h / 2.0;
+    double r = std::min(w, h) / 2.0 - 2;
+
+    if (app.connecting) {
+        cairo_set_source_rgb(cr, 1.0, 0.8, 0.0);
+    } else if (app.connected) {
+        cairo_set_source_rgb(cr, 0.1, 0.8, 0.1);
+    } else {
+        cairo_set_source_rgb(cr, 0.9, 0.1, 0.1);
+    }
+
+    cairo_arc(cr, cx, cy, r, 0, 2 * G_PI);
+    cairo_fill(cr);
+
+    cairo_set_source_rgba(cr, 1, 1, 1, 0.3);
+    cairo_arc(cr, cx - r * 0.2, cy - r * 0.2, r * 0.5, 0, 2 * G_PI);
+    cairo_fill(cr);
+
+    return FALSE;
+}
+
 static void refresh_config_list();
 
 static gboolean update_ping_ui(gpointer) {
@@ -469,6 +494,8 @@ static gboolean update_ping_ui(gpointer) {
 }
 
 static gboolean update_ui(gpointer) {
+    gtk_widget_queue_draw(app.indicator);
+
     if (app.connected) {
         auto now = std::chrono::steady_clock::now();
         int secs = std::chrono::duration_cast<std::chrono::seconds>(now - app.connect_time).count();
@@ -886,7 +913,7 @@ static void ping_all_configs() {
         for (int i = 0; i < (int)app.configs.size(); i++) {
             {
                 std::lock_guard<std::mutex> lock(app.ping_mutex);
-                app.ping_results[i] = "⏳";
+                app.ping_results[i] = "...";
             }
             g_idle_add(update_ping_ui, nullptr);
 
@@ -895,13 +922,9 @@ static void ping_all_configs() {
             {
                 std::lock_guard<std::mutex> lock(app.ping_mutex);
                 if (ms >= 0) {
-                    std::string color;
-                    if (ms < 100) color = "🟢";
-                    else if (ms < 300) color = "🟡";
-                    else color = "🔴";
-                    app.ping_results[i] = color + " " + std::to_string(ms) + " ms";
+                    app.ping_results[i] = std::to_string(ms) + " ms";
                 } else {
-                    app.ping_results[i] = "🔴 timeout";
+                    app.ping_results[i] = "timeout";
                 }
             }
             g_idle_add(update_ping_ui, nullptr);
@@ -1014,6 +1037,12 @@ static void activate(GtkApplication *gtkapp, gpointer) {
     GtkWidget *main_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_set_border_width(GTK_CONTAINER(main_box), 16);
     gtk_container_add(GTK_CONTAINER(app.window), main_box);
+
+    app.indicator = gtk_drawing_area_new();
+    gtk_widget_set_size_request(app.indicator, 80, 80);
+    gtk_widget_set_halign(app.indicator, GTK_ALIGN_CENTER);
+    g_signal_connect(app.indicator, "draw", G_CALLBACK(draw_indicator), nullptr);
+    gtk_box_pack_start(GTK_BOX(main_box), app.indicator, FALSE, FALSE, 8);
 
     app.lbl_time = gtk_label_new("00:00:00");
     GtkStyleContext *ctx = gtk_widget_get_style_context(app.lbl_time);
